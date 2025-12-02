@@ -1,0 +1,179 @@
+# app/rag.py
+import os
+from typing import List, Optional, Tuple, Dict, Any
+
+import pdfplumber
+import chromadb
+from chromadb.utils import embedding_functions
+from chromadb.config import Settings
+
+from openai import OpenAI
+
+# -------------------------
+# Chroma persistent client
+# -------------------------
+CHROMA_PERSIST_DIR = "./chroma_db"
+
+chroma_client = chromadb.Client(
+    Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory=CHROMA_PERSIST_DIR,
+    )
+)
+
+# -------------------------
+# OpenAI client (single)
+# -------------------------
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+if not OPENAI_KEY:
+    raise RuntimeError(
+        "OPENAI_API_KEY not found in environment. Export it before starting the backend."
+    )
+
+client = OpenAI(api_key=OPENAI_KEY)
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def extract_text_from_pdf(path: str) -> str:
+    texts: List[str] = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            texts.append(page.extract_text() or "")
+    return "\n".join(texts)
+
+
+def create_embeddings_and_store(
+    doc_texts: List[str], persist_directory: str = CHROMA_PERSIST_DIR, ids: Optional[List[str]] = None
+) -> bool:
+    """
+    Create (or open) a Chroma collection named 'docs' and add documents.
+    Uses Chroma's OpenAIEmbeddingFunction so Chroma will call OpenAI for embeddings.
+    """
+    ef = embedding_functions.OpenAIEmbeddingFunction(api_key=OPENAI_KEY, model_name="text-embedding-3-small")
+
+    try:
+        collection = chroma_client.get_collection(name="docs")
+    except Exception:
+        collection = chroma_client.create_collection(name="docs", embedding_function=ef)
+
+    if ids is None:
+        ids = [f"doc_{i}" for i in range(len(doc_texts))]
+
+    collection.add(ids=ids, documents=doc_texts)
+
+    # persist to disk (safe call; may be a no-op on some Chroma builds)
+    try:
+        chroma_client.persist()
+    except Exception:
+        pass
+
+    return True
+
+
+def init_retriever(persist_directory: str = CHROMA_PERSIST_DIR):
+    """
+    Return (chroma_client, collection). Raises RuntimeError if collection not present.
+    """
+    try:
+        collection = chroma_client.get_collection("docs")
+    except Exception as e:
+        raise RuntimeError("No collection found; upload docs first.") from e
+    return chroma_client, collection
+
+
+# -------------------------
+# OpenAI chat helper
+# -------------------------
+def openai_chat_completion(prompt: str) -> str:
+    """
+    Call OpenAI chat completions using the new OpenAI client.
+    Handles object-like or dict-like responses for portability.
+    """
+    resp = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+    )
+
+    choice = resp.choices[0]
+    # attempt object-like access, then dict-like
+    msg = getattr(choice, "message", None) or (choice.get("message") if hasattr(choice, "get") else None)
+
+    if msg is None:
+        text = getattr(choice, "text", None) or (choice.get("text") if hasattr(choice, "get") else "")
+    else:
+        if isinstance(msg, dict):
+            text = msg.get("content", "")
+        else:
+            text = getattr(msg, "content", "") or getattr(msg, "text", "")
+
+    return (text or "").strip()
+
+
+# -------------------------
+# Answer / RAG pipeline
+# -------------------------
+def answer_query(question: str, collection, top_k: int = 3) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    1) create embedding for query using the new OpenAI client (client)
+    2) query Chroma collection
+    3) build a prompt and call the chat completion helper
+    """
+    # 1) create embedding for the question
+    emb_resp = client.embeddings.create(model="text-embedding-3-small", input=[question])
+    embedding = emb_resp.data[0].embedding
+
+    # 2) query the Chroma collection (signature may vary by version)
+    # try to handle both dict and list shaped returns
+    res = collection.query(
+        query_embeddings=[embedding],
+        n_results=top_k,
+        include=["documents", "distances", "metadatas"],
+    )
+
+    # normalize returned documents into a simple list of strings
+    documents_list = None
+    if isinstance(res, dict):
+        # common shapes:
+        # {"documents": [[doc1, doc2,...]], ...}  OR {"documents": [doc1, doc2, ...], ...}
+        docs_field = res.get("documents", None)
+        if isinstance(docs_field, list):
+            # if first element is list -> nested list (list of result-sets)
+            if len(docs_field) > 0 and isinstance(docs_field[0], list):
+                documents_list = docs_field[0]
+            else:
+                documents_list = docs_field
+    elif isinstance(res, list):
+        documents_list = res
+    if documents_list is None:
+        documents_list = []
+
+    # take top_k (guard in case there are fewer)
+    flattened_docs = documents_list[:top_k]
+
+    # 3) build context & sources
+    context_parts: List[str] = []
+    sources: List[Dict[str, Any]] = []
+    for doc in flattened_docs:
+        snippet = doc[:800] if isinstance(doc, str) else str(doc)
+        context_parts.append(snippet)
+        sources.append({"snippet": snippet[:200]})
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    if context.strip() == "":
+        prompt = f"Question: {question}\n\nAnswer concisely:"
+    else:
+        prompt = (
+            f"Use the context below to answer the question.\n\nContext:\n{context}\n\n"
+            f"Question: {question}\n\nAnswer concisely and cite which snippet you used."
+        )
+
+    # call helper that uses client.chat.completions
+    answer_text = openai_chat_completion(prompt)
+    return answer_text, sources
