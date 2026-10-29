@@ -1,9 +1,16 @@
-# 📄 AI Document Assistant (RAG Pipeline)
+# AI Document Assistant (RAG)
 
-A production-ready AI tool that allows users to chat with PDF documents.
+Ask questions about your own PDF and text files and get answers with the source passages they came from.
 
-## 🚀 Tech Stack
-- **Python** (FastAPI, Streamlit)
-- **AI:** OpenAI GPT-4o + Embeddings
-- **Database:** ChromaDB (Vector Store)
-- **Features:** PDF Chunking, Vector Search, Source Citations
+## How it works
+1. Reads PDFs/text files and splits them into overlapping chunks
+2. Creates embeddings (OpenAI text-embedding-3-small) and stores them in ChromaDB
+3. For each question, finds the most relevant chunks and lets GPT-4o answer using only those, with sources
+
+## Tech
+Python, FastAPI, Streamlit, OpenAI, ChromaDB, Docker
+
+## Run
+pip install -r requirements.txt
+export OPENAI_API_KEY=...
+streamlit run streamlit_app.py
